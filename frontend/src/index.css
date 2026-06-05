@@ -1,0 +1,28 @@
+:root {
+  font-family: "Plus Jakarta Sans", ui-sans-serif, system-ui, "Segoe UI", Roboto, Arial, sans-serif;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  background: #f8fffc;
+  color: #0c1f17;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+#root {
+  min-height: 100svh;
+}
+
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+}
+
