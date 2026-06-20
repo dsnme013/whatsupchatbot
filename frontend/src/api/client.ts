@@ -7,6 +7,7 @@ const API_BASE_URL =
 async function http<T>(path: string, init?: RequestInit, schema?: z.ZodType<T>): Promise<T> {
   const res = await fetch(`${API_BASE_URL}${path}`, {
     headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
+    signal: init?.signal ?? AbortSignal.timeout(12_000),
     ...init
   });
   const json = await res.json().catch(() => ({}));
@@ -72,6 +73,7 @@ const MatchRes = z.object({
 
 export async function matchDoctors(payload: {
   triage: {
+    sessionId?: string;
     mainSymptom: string;
     symptomText?: string;
     onset: "today" | "yesterday" | "2-3days" | "1week+";
@@ -99,15 +101,18 @@ export async function saveHistory(payload: {
   return http("/api/v1/history", { method: "POST", body: JSON.stringify(payload) });
 }
 
+const BookingShape = z.object({
+  id: z.string(),
+  sessionId: z.string(),
+  doctorId: z.string(),
+  slotAtIso: z.string(),
+  mode: z.enum(["video", "home"]),
+  createdAtIso: z.string(),
+  feeInr: z.number().optional()
+});
+
 const CreateBookingRes = z.object({
-  booking: z.object({
-    id: z.string(),
-    sessionId: z.string(),
-    doctorId: z.string(),
-    slotAtIso: z.string(),
-    mode: z.enum(["video", "home"]),
-    createdAtIso: z.string()
-  }),
+  booking: BookingShape,
   checklist: z.array(z.object({ id: z.string(), when: z.enum(["now", "before"]), text: z.string() }))
 });
 
@@ -116,13 +121,23 @@ export async function createBooking(payload: {
   doctorId: string;
   slotAtIso: string;
   mode: "video" | "home";
-  patient: { name: string; phone?: string; address?: string };
+  patient: {
+    name: string;
+    age?: number;
+    gender?: "male" | "female" | "other";
+    phone?: string;
+    address?: string;
+    city?: string;
+    village?: string;
+    pincode?: string;
+    house_number?: string;
+  };
 }) {
   return http("/api/v1/booking", { method: "POST", body: JSON.stringify(payload) }, CreateBookingRes);
 }
 
 const RescheduleBookingRes = z.object({
-  booking: CreateBookingRes.shape.booking,
+  booking: BookingShape,
   doctor: z
     .object({
       id: z.string(),
@@ -143,5 +158,31 @@ export async function rescheduleBooking(
     { method: "PATCH", body: JSON.stringify(payload) },
     RescheduleBookingRes
   );
+}
+
+const GetBookingRes = z.object({
+  booking: CreateBookingRes.shape.booking.extend({
+    status: z.enum(["pending", "accepted", "rescheduled"]).optional(),
+    acceptedAtIso: z.string().optional(),
+    approvalMessage: z.string().optional(),
+    rescheduledAtIso: z.string().optional(),
+    rescheduleMessage: z.string().optional()
+  }),
+  doctor: z.object({ id: z.string(), name: z.string() }).passthrough().nullable(),
+  approvalMessage: z.string().nullable().optional(),
+  rescheduleMessage: z.string().nullable().optional()
+});
+
+export async function getBooking(bookingId: string) {
+  return http(`/api/v1/booking/${bookingId}`, undefined, GetBookingRes);
+}
+
+const DoctorFeesRes = z.object({
+  video: z.number(),
+  home: z.number()
+});
+
+export async function getDoctorFees(doctorId: string) {
+  return http(`/api/v1/fees/${doctorId}`, undefined, DoctorFeesRes);
 }
 

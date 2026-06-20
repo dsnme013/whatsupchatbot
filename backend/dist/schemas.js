@@ -1,5 +1,6 @@
 import { z } from "zod";
 export const TriageRequestSchema = z.object({
+    sessionId: z.string().min(6).max(80).optional(),
     mainSymptom: z.string().min(1).max(80),
     symptomText: z.string().min(0).max(800).optional(),
     onset: z.enum(["today", "yesterday", "2-3days", "1week+"]),
@@ -52,12 +53,30 @@ export const CreateBookingSchema = z.object({
     mode: z.enum(["video", "home"]),
     patient: z.object({
         name: z.string().min(1).max(80),
+        age: z.number().int().min(1).max(120).optional(),
+        gender: z.enum(["male", "female", "other"]).optional(),
         phone: z
             .union([z.literal(""), z.string().min(7).max(20)])
             .optional()
             .transform((v) => (v === "" ? undefined : v)),
         address: z
             .union([z.literal(""), z.string().max(200)])
+            .optional()
+            .transform((v) => (v === "" ? undefined : v)),
+        city: z
+            .union([z.literal(""), z.string().min(2).max(80)])
+            .optional()
+            .transform((v) => (v === "" ? undefined : v)),
+        village: z
+            .union([z.literal(""), z.string().min(2).max(80)])
+            .optional()
+            .transform((v) => (v === "" ? undefined : v)),
+        pincode: z
+            .union([z.literal(""), z.string().regex(/^\d{6}$/)])
+            .optional()
+            .transform((v) => (v === "" ? undefined : v)),
+        house_number: z
+            .union([z.literal(""), z.string().min(1).max(40)])
             .optional()
             .transform((v) => (v === "" ? undefined : v))
     })

@@ -1,0 +1,121 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Session {
+  sessionId                  String    @id @map("session_id") @db.VarChar(80)
+  createdAt                  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  consentToCollectHealthInfo Boolean?  @map("consent_collect")
+  triageInput                Json?     @map("triage_input")
+  triage                     Json?
+  history                    Json?
+  bookings                   Booking[]
+
+  @@map("sessions")
+}
+
+model Booking {
+  id                String            @id @db.VarChar(20)
+  sessionId         String            @map("session_id") @db.VarChar(80)
+  session           Session           @relation(fields: [sessionId], references: [sessionId], onDelete: Cascade)
+  createdAt         DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+  doctorId          String            @map("doctor_id") @db.VarChar(80)
+  slotAtIso         DateTime          @map("slot_at") @db.Timestamptz(6)
+  mode              String            @db.VarChar(10)
+  feeInr            Int?              @map("fee_inr")
+  status            String            @default("pending") @db.VarChar(20)
+  acceptedAtIso     DateTime?         @map("accepted_at") @db.Timestamptz(6)
+  approvalMessage   String?           @map("approval_message") @db.Text
+  rescheduledAtIso  DateTime?         @map("rescheduled_at") @db.Timestamptz(6)
+  rescheduleMessage String?           @map("reschedule_message") @db.Text
+  patientName       String            @map("patient_name") @db.VarChar(120)
+  patientAge        Int?              @map("patient_age")
+  patientGender     String?           @map("patient_gender") @db.VarChar(10)
+  patientPhone      String?           @map("patient_phone") @db.VarChar(20)
+  patientAddress    String?           @map("patient_address") @db.VarChar(300)
+  patientCity       String?           @map("patient_city") @db.VarChar(80)
+  patientVillage    String?           @map("patient_village") @db.VarChar(80)
+  patientPincode    String?           @map("patient_pincode") @db.VarChar(10)
+  patientHouseNumber String?          @map("patient_house_number") @db.VarChar(40)
+  dashboardPatient  DashboardPatient?
+
+  @@index([sessionId])
+  @@index([doctorId])
+  @@map("bookings")
+}
+
+model DashboardPatient {
+  id        Int              @id @default(autoincrement())
+  bookingId String           @unique @map("booking_id") @db.VarChar(20)
+  booking   Booking          @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  name      String           @db.VarChar(120)
+  age       Int
+  gender    String           @db.VarChar(2)
+  symptom   String           @db.Text
+  onset     String           @db.VarChar(40)
+  score     Int
+  tier      String           @db.VarChar(20)
+  flags     Json
+  comorb    Json
+  mode      String           @db.VarChar(20)
+  time      String           @db.VarChar(20)
+  color     String           @db.VarChar(20)
+  status    String           @db.VarChar(20)
+  fee       Int
+  thread    DashboardThread?
+
+  @@map("dashboard_patients")
+}
+
+model DashboardThread {
+  id        Int                @id @default(autoincrement())
+  patientId Int                @unique @map("patient_id")
+  patient   DashboardPatient   @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  unread    Boolean            @default(false)
+  messages  DashboardMessage[]
+
+  @@map("dashboard_threads")
+}
+
+model DashboardMessage {
+  id        Int             @id @default(autoincrement())
+  threadId  Int             @map("thread_id")
+  thread    DashboardThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  who       String          @db.VarChar(10)
+  t         String          @db.VarChar(40)
+  txt       String          @db.Text
+  sortOrder Int             @default(0) @map("sort_order")
+
+  @@index([threadId])
+  @@map("dashboard_messages")
+}
+
+model DashboardProfile {
+  id                    Int     @id @default(1)
+  name                  String  @db.VarChar(120)
+  speciality            String  @db.VarChar(80)
+  fee                   Int
+  homeFee               Int     @map("home_fee")
+  languages             String  @db.VarChar(120)
+  bio                   String  @db.Text
+  acceptVideo           Boolean @default(true) @map("accept_video")
+  acceptHomeVisits      Boolean @default(true) @map("accept_home_visits")
+  autoAcceptLow         Boolean @default(false) @map("auto_accept_low")
+  whatsappNotifications Boolean @default(true) @map("whatsapp_notifications")
+
+  @@map("dashboard_profile")
+}
+
+model DashboardRuntime {
+  id            Int     @id @default(1)
+  available     Boolean @default(false)
+  scheduleJson  Json    @default("[]") @map("schedule_json")
+  openSlotsJson Json    @default("[]") @map("open_slots_json")
+
+  @@map("dashboard_runtime")
+}

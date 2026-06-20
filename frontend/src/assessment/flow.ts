@@ -20,11 +20,13 @@ export type RedFlagKey =
 
 export type AssessmentEffects = {
   mainSymptom?: string;
+  symptomDetail?: string;
   onset?: Onset;
   severity0to10?: number;
   redFlag?: RedFlagKey;
   clearRedFlags?: boolean;
   comorbidity?: string;
+  preferredMode?: "video" | "home";
 };
 
 export type AssessmentOption = {

@@ -6,6 +6,8 @@ import {
   saveConsent,
   saveHistory,
   createBooking,
+  getBooking,
+  getDoctorFees,
   rescheduleBooking
 } from "./api/client";
 import type { Doctor, TriageResult } from "./types";
@@ -13,12 +15,39 @@ import {
   ASSESSMENT_FLOW,
   formatScoreMessage,
   getScoreTier,
-  type AssessmentEffects
+  type AssessmentEffects,
+  type AssessmentQuestion
 } from "./assessment/flow";
+import {
+  type CareIntent,
+  defaultModeForIntent,
+  FLOW_BY_INTENT,
+  INTENT_COMPLETE_SUMMARY,
+  INTENT_INTRO
+} from "./flows/serviceFlows";
+import { buildLocalTriage } from "./lib/localTriage";
+import {
+  answerSupportQuestion,
+  greetingReply,
+  isGreeting,
+  SUPPORT_QUICK_TOPICS,
+  type SupportContext
+} from "./support/postBooking";
 
 type SelectedSlot = { atIso: string; mode: "video" | "home" };
 
+type ProfilePhase =
+  | "name"
+  | "age"
+  | "gender"
+  | "phone"
+  | "city"
+  | "village"
+  | "pincode"
+  | "house_number";
+
 type Step =
+  | "profile"
   | "greeting"
   | "quick_menu"
   | "symptoms"
@@ -109,14 +138,35 @@ function formatAppointmentTime(atIso: string) {
   });
 }
 
+function nameInitials(name: string) {
+  return (
+    name
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((part) => part[0])
+      .join("")
+      .slice(0, 2)
+      .toUpperCase() || "?"
+  );
+}
+
 type ChatAppProps = {
   onBack?: () => void;
 };
 
 export default function ChatApp({ onBack }: ChatAppProps) {
   const [sessionId, setSessionId] = useState<string | null>(null);
-  const [step, setStep] = useState<Step>("greeting");
+  const [step, setStep] = useState<Step>("profile");
   const [messages, setMessages] = useState<Msg[]>([]);
+  const [patientName, setPatientName] = useState("");
+  const [patientAge, setPatientAge] = useState<number | null>(null);
+  const [patientGender, setPatientGender] = useState<"male" | "female" | "other" | null>(null);
+  const [profilePhase, setProfilePhase] = useState<ProfilePhase>("name");
+  const [patientPhone, setPatientPhone] = useState("");
+  const [patientCity, setPatientCity] = useState("");
+  const [patientVillage, setPatientVillage] = useState("");
+  const [patientPincode, setPatientPincode] = useState("");
+  const [patientHouse, setPatientHouse] = useState("");
 
   const [mainSymptom, setMainSymptom] = useState<string>("Fever");
   const [symptomText, setSymptomText] = useState<string>(
@@ -159,7 +209,20 @@ export default function ChatApp({ onBack }: ChatAppProps) {
   const selectedSlotRef = useRef<SelectedSlot | null>(null);
   const bookingIdRef = useRef<string | null>(null);
   const bookingRefLabelRef = useRef<string | null>(null);
-  const stepRef = useRef<Step>("greeting");
+  const approvalShownRef = useRef(false);
+  const lastSyncedSlotAtIsoRef = useRef<string | null>(null);
+  const lastDoctorRescheduleAtRef = useRef<string | null>(null);
+  const bookingFeeRef = useRef<number | null>(null);
+  const supportWelcomedRef = useRef(false);
+  const stepRef = useRef<Step>("profile");
+  const patientNameRef = useRef("");
+  const patientAgeRef = useRef<number | null>(null);
+  const patientGenderRef = useRef<"male" | "female" | "other" | null>(null);
+  const patientPhoneRef = useRef("");
+  const patientCityRef = useRef("");
+  const patientVillageRef = useRef("");
+  const patientPincodeRef = useRef("");
+  const patientHouseRef = useRef("");
   const bookingCompleteRef = useRef(false);
   const assessmentPointsRef = useRef(0);
   const mainSymptomRef = useRef(mainSymptom);
@@ -167,6 +230,9 @@ export default function ChatApp({ onBack }: ChatAppProps) {
   const severityRef = useRef(severity0to10);
   const comorbiditiesRef = useRef(comorbidities);
   const redFlagsRef = useRef(redFlags);
+  const careIntentRef = useRef<CareIntent>("symptoms");
+  const activeFlowRef = useRef<AssessmentQuestion[]>(ASSESSMENT_FLOW);
+  const symptomDetailRef = useRef("");
 
   useEffect(() => {
     historyTextRef.current = historyText;
@@ -229,6 +295,63 @@ export default function ChatApp({ onBack }: ChatAppProps) {
     bookingCompleteRef.current = bookingComplete;
   }, [bookingComplete]);
 
+  /* Sync doctor-dashboard accept / reschedule into the patient chat. */
+  useEffect(() => {
+    if (!bookingComplete) return;
+
+    const pollBookingUpdates = async () => {
+      const bid = bookingIdRef.current;
+      if (!bid) return;
+      try {
+        const res = await getBooking(bid);
+        const b = res.booking;
+        if (b.feeInr != null) {
+          bookingFeeRef.current = b.feeInr;
+          const did = doctorIdRef.current;
+          if (did) {
+            doctorsRef.current = doctorsRef.current.map((d) =>
+              d.id === did ? { ...d, price: { ...d.price, [b.mode]: b.feeInr! } } : d
+            );
+          }
+        }
+
+        if (b.status === "accepted" && !approvalShownRef.current) {
+          approvalShownRef.current = true;
+          const text =
+            res.approvalMessage ??
+            b.approvalMessage ??
+            "✅ Your appointment is approved! Your doctor confirmed your visit. We'll remind you before your appointment.";
+          push({ from: "bot", kind: "text", text });
+        }
+
+        const doctorRescheduledAt = b.rescheduledAtIso ?? null;
+        if (
+          doctorRescheduledAt &&
+          doctorRescheduledAt !== lastDoctorRescheduleAtRef.current &&
+          b.slotAtIso !== lastSyncedSlotAtIsoRef.current
+        ) {
+          lastDoctorRescheduleAtRef.current = doctorRescheduledAt;
+          lastSyncedSlotAtIsoRef.current = b.slotAtIso;
+          selectedSlotRef.current = { atIso: b.slotAtIso, mode: b.mode };
+          modeRef.current = b.mode;
+          setMode(b.mode);
+          supportWelcomedRef.current = false;
+          const text =
+            res.rescheduleMessage ??
+            b.rescheduleMessage ??
+            `📅 Your doctor rescheduled your appointment to ${formatAppointmentTime(b.slotAtIso)}.`;
+          push({ from: "bot", kind: "text", text });
+        }
+      } catch {
+        /* booking may not exist yet or server restarted */
+      }
+    };
+
+    void pollBookingUpdates();
+    const interval = window.setInterval(() => void pollBookingUpdates(), 4000);
+    return () => window.clearInterval(interval);
+  }, [bookingComplete]);
+
   const SCROLL_THRESHOLD_PX = 80;
 
   function isNearBottom(el: HTMLDivElement) {
@@ -276,7 +399,8 @@ export default function ChatApp({ onBack }: ChatAppProps) {
   const steps = useMemo(
     () =>
       [
-        { id: "greeting", label: "Greeting", icon: "👋", hint: "Start here" },
+        { id: "profile", label: "Your details", icon: "👤", hint: "Name, phone & address" },
+        { id: "greeting", label: "Greeting", icon: "👋", hint: "Who needs care" },
         { id: "quick_menu", label: "Quick menu", icon: "⚡", hint: "Pick a need" },
         { id: "symptoms", label: "Symptoms", icon: "🩺", hint: "Tell us more" },
         { id: "assessment", label: "Assessment", icon: "📊", hint: "Smart triage" },
@@ -333,10 +457,156 @@ export default function ChatApp({ onBack }: ChatAppProps) {
       setComorbidities(list);
       comorbiditiesRef.current = list;
     }
+    if (effects.symptomDetail) {
+      symptomDetailRef.current = symptomDetailRef.current
+        ? `${symptomDetailRef.current}; ${effects.symptomDetail}`
+        : effects.symptomDetail;
+    }
+    if (effects.preferredMode) {
+      modeRef.current = effects.preferredMode;
+      setMode(effects.preferredMode);
+    }
+  }
+
+  function resetAssessmentState() {
+    setAssessmentPoints(0);
+    assessmentPointsRef.current = 0;
+    symptomDetailRef.current = "";
+    setAssessmentActive(true);
+    setComorbidities([]);
+    comorbiditiesRef.current = [];
+    const cleared = {
+      breathingTrouble: false,
+      fainting: false,
+      confusion: false,
+      chestPain: false,
+      severeDehydration: false,
+      stiffNeck: false,
+      spo2Below92: false
+    };
+    setRedFlags(cleared);
+    redFlagsRef.current = cleared;
+  }
+
+  function pushQuickMenuChips(userReply?: string) {
+    if (userReply) push({ from: "user", kind: "text", text: userReply });
+    push({
+      from: "bot",
+      kind: "chips",
+      text: "Thanks. What would you like help with today?",
+      chips: [
+        { label: "🩺 I have symptoms", onPick: () => startCareFlow("symptoms", "🩺 I have symptoms") },
+        { label: "💊 Medicine refill", onPick: () => startCareFlow("refill", "💊 Medicine refill") },
+        { label: "🔬 Understand lab report", onPick: () => startCareFlow("lab_report", "🔬 Understand lab report") },
+        { label: "🏠 Home nurse care", onPick: () => startCareFlow("nurse_care", "🏠 Home nurse care") },
+        {
+          label: "🚨 Emergency — call now",
+          tone: "danger",
+          onPick: () => startCareFlow("emergency", "🚨 Emergency — call now")
+        }
+      ]
+    });
+  }
+
+  function startCareFlow(intent: CareIntent, userLabel: string) {
+    if (intent === "emergency") {
+      setStep("symptoms");
+      push({ from: "user", kind: "text", text: userLabel });
+      showEmergencyFlow();
+      return;
+    }
+
+    careIntentRef.current = intent;
+    activeFlowRef.current = intent === "symptoms" ? ASSESSMENT_FLOW : FLOW_BY_INTENT[intent];
+    resetAssessmentState();
+
+    if (intent !== "symptoms") {
+      const defaultMain =
+        intent === "refill"
+          ? "Medicine refill"
+          : intent === "lab_report"
+            ? "Lab report review"
+            : "Home nurse care";
+      setMainSymptom(defaultMain);
+      mainSymptomRef.current = defaultMain;
+      const visitMode = defaultModeForIntent(intent);
+      modeRef.current = visitMode;
+      setMode(visitMode);
+    }
+
+    setStep("symptoms");
+    push({ from: "user", kind: "text", text: userLabel });
+    push({ from: "bot", kind: "text", text: INTENT_INTRO[intent] });
+    window.setTimeout(() => askAssessmentQuestion(0), 500);
+  }
+
+  function showEmergencyFlow() {
+    careIntentRef.current = "emergency";
+    push({
+      from: "bot",
+      kind: "text",
+      text:
+        "🚨 If this is life-threatening — severe chest pain, trouble breathing, heavy bleeding, stroke signs, or loss of consciousness — call emergency services immediately.\n\nIndia: 112 (unified emergency) · 108 (ambulance)"
+    });
+    push({
+      from: "bot",
+      kind: "chips",
+      chips: [
+        {
+          label: "📞 Call 112",
+          tone: "danger",
+          onPick: () => {
+            push({ from: "user", kind: "text", text: "📞 Call 112" });
+            window.location.href = "tel:112";
+          }
+        },
+        {
+          label: "📞 Call 108",
+          tone: "danger",
+          onPick: () => {
+            push({ from: "user", kind: "text", text: "📞 Call 108" });
+            window.location.href = "tel:108";
+          }
+        },
+        {
+          label: "🩺 Book urgent doctor consult",
+          onPick: () => void startUrgentConsult()
+        },
+        {
+          label: "← I'm okay — back to menu",
+          onPick: () => {
+            setStep("quick_menu");
+            pushQuickMenuChips("← Back to menu");
+          }
+        }
+      ]
+    });
+  }
+
+  async function startUrgentConsult() {
+    push({ from: "user", kind: "text", text: "🩺 Book urgent doctor consult" });
+    careIntentRef.current = "symptoms";
+    setMainSymptom("Urgent consult");
+    mainSymptomRef.current = "Urgent consult";
+    setSymptomText("Patient requested urgent doctor consult from the emergency menu.");
+    setOnset("today");
+    onsetRef.current = "today";
+    setSeverity0to10(9);
+    severityRef.current = 9;
+    modeRef.current = "video";
+    setMode("video");
+    setAssessmentActive(false);
+    setStep("assessment");
+    push({
+      from: "bot",
+      kind: "text",
+      text: "Connecting you with the next available doctor for an urgent video consult…"
+    });
+    await runAssessment({ skipUserEcho: true });
   }
 
   function askAssessmentQuestion(qIndex: number) {
-    const q = ASSESSMENT_FLOW[qIndex];
+    const q = activeFlowRef.current[qIndex];
     if (!q) return;
 
     push({
@@ -351,7 +621,8 @@ export default function ChatApp({ onBack }: ChatAppProps) {
   }
 
   function processAssessmentAnswer(questionId: string, optionId: string) {
-    const q = ASSESSMENT_FLOW.find((x) => x.id === questionId);
+    const flow = activeFlowRef.current;
+    const q = flow.find((x) => x.id === questionId);
     const opt = q?.options.find((o) => o.id === optionId);
     if (!q || !opt) return;
 
@@ -365,8 +636,8 @@ export default function ChatApp({ onBack }: ChatAppProps) {
     window.setTimeout(() => {
       push({ from: "bot", kind: "score", added: opt.points, total: newTotal });
 
-      const nextIndex = ASSESSMENT_FLOW.findIndex((x) => x.id === questionId) + 1;
-      if (nextIndex < ASSESSMENT_FLOW.length) {
+      const nextIndex = flow.findIndex((x) => x.id === questionId) + 1;
+      if (nextIndex < flow.length) {
         window.setTimeout(() => askAssessmentQuestion(nextIndex), 450);
       } else {
         window.setTimeout(() => void completeConversationalAssessment(newTotal), 500);
@@ -381,19 +652,45 @@ export default function ChatApp({ onBack }: ChatAppProps) {
     const hasRedFlag = Object.values(redFlagsRef.current).some(Boolean);
     const tier = getScoreTier(totalPoints, hasRedFlag);
 
-    const symptomSummary = `${mainSymptomRef.current} since ${onsetRef.current}, severity ${severityRef.current}/10`;
+    const intent = careIntentRef.current;
+    const detail = symptomDetailRef.current;
+    const symptomSummary = detail
+      ? `${mainSymptomRef.current}: ${detail}. Since ${onsetRef.current}, severity ${severityRef.current}/10`
+      : `${mainSymptomRef.current} since ${onsetRef.current}, severity ${severityRef.current}/10`;
     setSymptomText(symptomSummary);
 
     push({ from: "bot", kind: "text", text: "🔍 Reviewing your answers…" });
     await new Promise((r) => window.setTimeout(r, 700));
 
+    const intentNote =
+      intent !== "symptoms" && intent !== "emergency" ? INTENT_COMPLETE_SUMMARY[intent] : "";
+
     push({
       from: "bot",
       kind: "text",
-      text: `📊 Assessment complete — Score: ${totalPoints} pts (${tier.label} concern).\n${tier.summary}`
+      text: `📊 Assessment complete — Score: ${totalPoints} pts (${tier.label} concern).\n${tier.summary}${intentNote ? `\n\n${intentNote}` : ""}`
     });
 
-    if (tier.videoRecommended) {
+    const visitMode =
+      intent === "nurse_care"
+        ? "home"
+        : intent === "refill" || intent === "lab_report"
+          ? "video"
+          : tier.videoRecommended
+            ? "video"
+            : modeRef.current;
+
+    if (visitMode === "home" || tier.homeVisitRecommended || intent === "nurse_care") {
+      if (intent === "nurse_care" || tier.homeVisitRecommended) {
+        push({
+          from: "bot",
+          kind: "text",
+          text: "🏠 Home visit is available — a qualified nurse or doctor can come to you."
+        });
+      }
+      modeRef.current = intent === "nurse_care" ? "home" : visitMode;
+      setMode(modeRef.current);
+    } else if (tier.videoRecommended || intent === "refill" || intent === "lab_report") {
       push({
         from: "bot",
         kind: "text",
@@ -412,9 +709,96 @@ export default function ChatApp({ onBack }: ChatAppProps) {
 
     push({
       from: "bot",
+      kind: "text",
+      text:
+        "🙏 Namaste. I'm CareConnect — here to help you feel better, safely.\n\nFirst, let me note your name, contact, and address so we can personalise your care."
+    });
+    push({
+      from: "bot",
+      kind: "text",
+      text: "What is your full name?"
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function normalizeIndianPhone(raw: string): string | null {
+    const digits = raw.replace(/\D/g, "");
+    if (digits.length === 10 && /^[6-9]/.test(digits)) return digits;
+    if (digits.length === 12 && digits.startsWith("91")) return digits.slice(2);
+    return null;
+  }
+
+  function formatPatientAddressLine(): string {
+    const house = patientHouseRef.current;
+    const village = patientVillageRef.current;
+    const city = patientCityRef.current;
+    const pincode = patientPincodeRef.current;
+    return `${house}, ${village}, ${city} - ${pincode}`;
+  }
+
+  function buildPatientPayload() {
+    return {
+      name: patientNameRef.current || "Patient",
+      age: patientAgeRef.current ?? undefined,
+      gender: patientGenderRef.current ?? undefined,
+      phone: patientPhoneRef.current || undefined,
+      city: patientCityRef.current || undefined,
+      village: patientVillageRef.current || undefined,
+      pincode: patientPincodeRef.current || undefined,
+      house_number: patientHouseRef.current || undefined,
+      address: formatPatientAddressLine()
+    };
+  }
+
+  function genderLabel(g: "male" | "female" | "other"): string {
+    if (g === "male") return "Male";
+    if (g === "female") return "Female";
+    return "Other";
+  }
+
+  function askGender() {
+    setProfilePhase("gender");
+    push({
+      from: "bot",
+      kind: "chips",
+      text: "What is your gender?",
+      chips: [
+        { label: "Male", onPick: () => onGenderSelected("male", "Male") },
+        { label: "Female", onPick: () => onGenderSelected("female", "Female") },
+        { label: "Other / Prefer not to say", onPick: () => onGenderSelected("other", "Other") }
+      ]
+    });
+  }
+
+  function onGenderSelected(gender: "male" | "female" | "other", label: string) {
+    setPatientGender(gender);
+    patientGenderRef.current = gender;
+    push({ from: "user", kind: "text", text: label });
+    setProfilePhase("phone");
+    push({
+      from: "bot",
+      kind: "text",
+      text: "What is your mobile number? (10-digit Indian number — we'll use it for appointment updates on WhatsApp)"
+    });
+  }
+
+  function finishProfileContact() {
+    const gender = patientGenderRef.current;
+    push({
+      from: "bot",
+      kind: "text",
+      text: `Got it — ${patientNameRef.current}, ${patientAgeRef.current} years, ${gender ? genderLabel(gender) : ""}.\n📱 ${patientPhoneRef.current}\n📍 ${formatPatientAddressLine()}`
+    });
+    startGreetingFlow();
+  }
+
+  function startGreetingFlow() {
+    setStep("greeting");
+    push({
+      from: "bot",
       kind: "chips",
       text:
-        "🙏 Namaste. I'm CareConnect — here to help you feel better, safely.\n\nI'll ask a few quick questions, score your answers, and suggest the best next step.\n\nWho is this care for?",
+        "Thanks! I'll ask a few quick questions, score your answers, and suggest the best next step.\n\nWho is this care for?",
       chips: [
         { label: "🙋 Me", onPick: () => go("quick_menu", "🙋 Me") },
         { label: "👨‍👩‍👧 Family member", onPick: () => go("quick_menu", "👨‍👩‍👧 Family member") },
@@ -422,58 +806,230 @@ export default function ChatApp({ onBack }: ChatAppProps) {
         { label: "👶 Child", onPick: () => go("quick_menu", "👶 Child") }
       ]
     });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }
+
+  function handleProfileInput(text: string) {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+
+    push({ from: "user", kind: "text", text: trimmed });
+
+    if (profilePhase === "name") {
+      if (trimmed.length < 2) {
+        push({ from: "bot", kind: "text", text: "Please enter your full name (at least 2 characters)." });
+        return;
+      }
+      setPatientName(trimmed);
+      patientNameRef.current = trimmed;
+      setProfilePhase("age");
+      push({ from: "bot", kind: "text", text: `Thanks, ${trimmed}. How old are you?` });
+      return;
+    }
+
+    if (profilePhase === "age") {
+      const age = Number.parseInt(trimmed, 10);
+      if (!Number.isFinite(age) || age < 1 || age > 120) {
+        push({
+          from: "bot",
+          kind: "text",
+          text: "Please enter a valid age between 1 and 120."
+        });
+        return;
+      }
+      setPatientAge(age);
+      patientAgeRef.current = age;
+      askGender();
+      return;
+    }
+
+    if (profilePhase === "phone") {
+      const phone = normalizeIndianPhone(trimmed);
+      if (!phone) {
+        push({
+          from: "bot",
+          kind: "text",
+          text: "Please enter a valid 10-digit mobile number (e.g. 9876543210)."
+        });
+        return;
+      }
+      setPatientPhone(phone);
+      patientPhoneRef.current = phone;
+      setProfilePhase("city");
+      push({ from: "bot", kind: "text", text: "Which city are you in?" });
+      return;
+    }
+
+    if (profilePhase === "city") {
+      if (trimmed.length < 2) {
+        push({ from: "bot", kind: "text", text: "Please enter your city name (at least 2 characters)." });
+        return;
+      }
+      setPatientCity(trimmed);
+      patientCityRef.current = trimmed;
+      setProfilePhase("village");
+      push({ from: "bot", kind: "text", text: "Village or locality name?" });
+      return;
+    }
+
+    if (profilePhase === "village") {
+      if (trimmed.length < 2) {
+        push({
+          from: "bot",
+          kind: "text",
+          text: "Please enter your village or locality (at least 2 characters)."
+        });
+        return;
+      }
+      setPatientVillage(trimmed);
+      patientVillageRef.current = trimmed;
+      setProfilePhase("pincode");
+      push({ from: "bot", kind: "text", text: "What's your pincode? (6 digits)" });
+      return;
+    }
+
+    if (profilePhase === "pincode") {
+      const pin = trimmed.replace(/\s/g, "");
+      if (!/^\d{6}$/.test(pin)) {
+        push({ from: "bot", kind: "text", text: "Please enter a valid 6-digit pincode (e.g. 560001)." });
+        return;
+      }
+      setPatientPincode(pin);
+      patientPincodeRef.current = pin;
+      setProfilePhase("house_number");
+      push({ from: "bot", kind: "text", text: "House / flat / door number?" });
+      return;
+    }
+
+    if (profilePhase === "house_number") {
+      if (trimmed.length < 1) {
+        push({ from: "bot", kind: "text", text: "Please enter your house or flat number." });
+        return;
+      }
+      setPatientHouse(trimmed);
+      patientHouseRef.current = trimmed;
+      finishProfileContact();
+    }
+  }
+
+  function supportContext(): SupportContext {
+    const picked = doctorsRef.current.find((d) => d.id === doctorIdRef.current);
+    const slot = selectedSlotRef.current;
+    const mode = slot?.mode ?? modeRef.current;
+    const liveFromDoctor = picked?.price?.[mode];
+    return {
+      patientName: patientNameRef.current,
+      doctorName: picked?.name ?? "your doctor",
+      when: slot ? formatAppointmentTime(slot.atIso) : "your scheduled time",
+      ref: bookingRefLabelRef.current ?? "your booking",
+      feeInr: bookingFeeRef.current ?? liveFromDoctor ?? undefined,
+      mode
+    };
+  }
+
+  async function refreshLiveFee(): Promise<void> {
+    const did = doctorIdRef.current;
+    const bid = bookingIdRef.current;
+    if (bid) {
+      try {
+        const res = await getBooking(bid);
+        if (res.booking.feeInr != null) {
+          bookingFeeRef.current = res.booking.feeInr;
+          if (did) {
+            const m = res.booking.mode;
+            doctorsRef.current = doctorsRef.current.map((d) =>
+              d.id === did ? { ...d, price: { ...d.price, [m]: res.booking.feeInr! } } : d
+            );
+          }
+          return;
+        }
+      } catch {
+        /* server may have restarted */
+      }
+    }
+    if (!did) return;
+    try {
+      const fees = await getDoctorFees(did);
+      const mode = modeRef.current;
+      bookingFeeRef.current = fees[mode];
+      doctorsRef.current = doctorsRef.current.map((d) => (d.id === did ? { ...d, price: fees } : d));
+    } catch {
+      /* keep last known fee */
+    }
+  }
+
+  function pushSupportQuickChips() {
+    push({
+      from: "bot",
+      kind: "chips",
+      chips: [
+        ...SUPPORT_QUICK_TOPICS.map((t) => ({
+          label: t.label,
+          onPick: () => {
+            push({ from: "user", kind: "text", text: t.label });
+            void (async () => {
+              await refreshLiveFee();
+              push({
+                from: "bot",
+                kind: "text",
+                text: answerSupportQuestion(t.query, supportContext())
+              });
+              pushSupportQuickChips();
+            })();
+          }
+        })),
+        {
+          label: "📅 Reschedule",
+          onPick: () => void startRescheduleFlow()
+        }
+      ]
+    });
+  }
+
+  async function handlePostBookingSupport(userText: string) {
+    await refreshLiveFee();
+    const ctx = supportContext();
+
+    if (isGreeting(userText)) {
+      supportWelcomedRef.current = true;
+      push({ from: "bot", kind: "text", text: greetingReply(ctx) });
+      pushSupportQuickChips();
+      return;
+    }
+
+    if (!supportWelcomedRef.current) {
+      supportWelcomedRef.current = true;
+      push({ from: "bot", kind: "text", text: greetingReply(ctx) });
+    }
+
+    push({ from: "bot", kind: "text", text: answerSupportQuestion(userText, ctx) });
+    pushSupportQuickChips();
+  }
+
+  function submitChatInput() {
+    const text = inputText.trim();
+    if (!text) return;
+    if (step === "profile" && profilePhase !== "gender") {
+      handleProfileInput(text);
+      setInputText("");
+      return;
+    }
+    push({ from: "user", kind: "text", text });
+    setInputText("");
+    if (bookingComplete && step === "confirm") {
+      void handlePostBookingSupport(text);
+    }
+  }
 
   function go(next: Step, userReply?: string) {
     setStep(next);
     if (next === "quick_menu") {
-      push({ from: "user", kind: "text", text: userReply ?? "Me" });
-      push({
-        from: "bot",
-        kind: "chips",
-        text: "Thanks. What would you like help with today?",
-        chips: [
-          { label: "🩺 I have symptoms", onPick: () => go("symptoms") },
-          { label: "💊 Medicine refill", onPick: () => push({ from: "bot", kind: "text", text: "Refill flow can be added next." }) },
-          { label: "🔬 Understand lab report", onPick: () => push({ from: "bot", kind: "text", text: "Lab report flow can be added next." }) },
-          { label: "🏠 Home nurse care", onPick: () => push({ from: "bot", kind: "text", text: "Nurse care flow can be added next." }) },
-          { label: "🚨 Emergency — call now", onPick: () => push({ from: "bot", kind: "text", text: "If this is an emergency, please call local emergency services immediately." }), tone: "danger" }
-        ]
-      });
+      pushQuickMenuChips(userReply ?? "Me");
+      return;
     }
 
     if (next === "symptoms") {
-      push({ from: "user", kind: "text", text: "🩺 I have symptoms" });
-      setAssessmentPoints(0);
-      assessmentPointsRef.current = 0;
-      setAssessmentActive(true);
-      setComorbidities([]);
-      comorbiditiesRef.current = [];
-      setRedFlags({
-        breathingTrouble: false,
-        fainting: false,
-        confusion: false,
-        chestPain: false,
-        severeDehydration: false,
-        stiffNeck: false,
-        spo2Below92: false
-      });
-      redFlagsRef.current = {
-        breathingTrouble: false,
-        fainting: false,
-        confusion: false,
-        chestPain: false,
-        severeDehydration: false,
-        stiffNeck: false,
-        spo2Below92: false
-      };
-      push({
-        from: "bot",
-        kind: "text",
-        text: "💚 I hear you — let's walk through a quick health check together. Tap an option below; your score updates after each answer."
-      });
-      window.setTimeout(() => askAssessmentQuestion(0), 500);
+      startCareFlow("symptoms", "🩺 I have symptoms");
+      return;
     }
 
     if (next === "assessment") {
@@ -485,28 +1041,22 @@ export default function ChatApp({ onBack }: ChatAppProps) {
     }
   }
 
-  async function runAssessment(opts?: { skipUserEcho?: boolean }) {
-    if (!opts?.skipUserEcho) {
+  function liveSymptomSummary() {
+    const detail = symptomDetailRef.current;
+    return detail
+      ? `${mainSymptomRef.current}: ${detail}. Since ${onsetRef.current}, severity ${severityRef.current}/10`
+      : symptomText;
+  }
+
+  function pushTriageCard(triage: TriageResult, opts?: { offline?: boolean }) {
+    setTriageResult(triage);
+    if (opts?.offline) {
       push({
-        from: "user",
+        from: "bot",
         kind: "text",
-        text: `${mainSymptomRef.current}. Started: ${onsetRef.current}. Severity: ${severityRef.current}/10.\n${symptomText}`
+        text: "⚠️ Could not reach the server — showing a local safety estimate. Start the backend (`cd backend && npm run dev`) for live doctor matching."
       });
     }
-    push({ from: "bot", kind: "text", text: "⚡ Checking the safest next step for you…" });
-
-    const triagePayload = {
-      mainSymptom: mainSymptomRef.current,
-      symptomText,
-      onset: onsetRef.current,
-      severity0to10: severityRef.current,
-      comorbidities: comorbiditiesRef.current,
-      redFlags: redFlagsRef.current
-    };
-
-    const { triage } = await matchDoctors({ triage: triagePayload, preferences: { mode, sortBy: "best_fit" } });
-    setTriageResult(triage);
-
     push({
       from: "bot",
       kind: "triage",
@@ -534,8 +1084,63 @@ export default function ChatApp({ onBack }: ChatAppProps) {
             "If you’re experiencing severe symptoms (breathing trouble, chest pain, confusion, fainting), please call local emergency services immediately."
         })
     });
-
     setStep("assessment");
+
+    const shouldAutoBook =
+      triage.recommendedNextStep !== "self_care" ||
+      assessmentPointsRef.current >= 50 ||
+      triage.redFlagTriggered;
+    if (shouldAutoBook) {
+      push({
+        from: "bot",
+        kind: "chips",
+        text: "Based on your score, booking a doctor is the safest next step.",
+        chips: [
+          {
+            label: "📅 Book a doctor now",
+            tone: "primary",
+            onPick: () => go("booking")
+          },
+          {
+            label: "↻ Retry connection",
+            onPick: () => void runAssessment({ skipUserEcho: true })
+          }
+        ]
+      });
+    }
+  }
+
+  async function runAssessment(opts?: { skipUserEcho?: boolean }) {
+    const summary = liveSymptomSummary();
+    if (!opts?.skipUserEcho) {
+      push({
+        from: "user",
+        kind: "text",
+        text: `${mainSymptomRef.current}. Started: ${onsetRef.current}. Severity: ${severityRef.current}/10.\n${summary}`
+      });
+    }
+    push({ from: "bot", kind: "text", text: "⚡ Checking the safest next step for you…" });
+
+    const triagePayload = {
+      mainSymptom: mainSymptomRef.current,
+      symptomText: summary,
+      onset: onsetRef.current,
+      severity0to10: severityRef.current,
+      age: patientAgeRef.current ?? undefined,
+      comorbidities: comorbiditiesRef.current,
+      redFlags: redFlagsRef.current
+    };
+
+    try {
+      const sid = await ensureSession();
+      const { triage } = await matchDoctors({
+        triage: { ...triagePayload, sessionId: sid ?? undefined },
+        preferences: { mode, sortBy: "best_fit" }
+      });
+      pushTriageCard(triage);
+    } catch {
+      pushTriageCard(buildLocalTriage(triagePayload), { offline: true });
+    }
   }
 
   async function runDoctorMatch(patch?: Partial<{ mode: "video" | "home"; gender: "female" | "male"; sortBy: string }>) {
@@ -545,32 +1150,49 @@ export default function ChatApp({ onBack }: ChatAppProps) {
 
     push({ from: "bot", kind: "text", text: "Thanks. I’ll show the best-fit doctors available today." });
     const triagePayload = {
-      mainSymptom,
-      symptomText,
-      onset,
-      severity0to10,
-      comorbidities,
-      redFlags
+      mainSymptom: mainSymptomRef.current,
+      symptomText: liveSymptomSummary(),
+      onset: onsetRef.current,
+      severity0to10: severityRef.current,
+      age: patientAgeRef.current ?? undefined,
+      comorbidities: comorbiditiesRef.current,
+      redFlags: redFlagsRef.current
     };
-    const { doctors } = await matchDoctors({
-      triage: triagePayload,
-      preferences: {
-        mode: nextMode,
-        gender: patch?.gender,
-        sortBy: (patch?.sortBy as any) ?? "best_fit"
-      }
-    });
-    doctorsRef.current = doctors;
-    setDoctors(doctors);
-    push({
-      from: "bot",
-      kind: "doctors",
-      doctors,
-      onPick: (id: string) => handleDoctorSelected(id, doctors),
-      onFilter: (p: Partial<{ mode: "video" | "home"; gender: "female" | "male"; sortBy: string }>) =>
-        void runDoctorMatch(p)
-    });
-    setStep("booking");
+    try {
+      const sid = await ensureSession();
+      const { doctors } = await matchDoctors({
+        triage: { ...triagePayload, sessionId: sid ?? undefined },
+        preferences: {
+          mode: nextMode,
+          gender: patch?.gender,
+          sortBy: (patch?.sortBy as any) ?? "best_fit"
+        }
+      });
+      doctorsRef.current = doctors;
+      setDoctors(doctors);
+      push({
+        from: "bot",
+        kind: "doctors",
+        doctors,
+        onPick: (id: string) => handleDoctorSelected(id, doctors),
+        onFilter: (p: Partial<{ mode: "video" | "home"; gender: "female" | "male"; sortBy: string }>) =>
+          void runDoctorMatch(p)
+      });
+      setStep("booking");
+    } catch {
+      push({
+        from: "bot",
+        kind: "chips",
+        text: "I couldn’t load doctors — the API may be offline. Start the backend on port 8787 and try again.",
+        chips: [
+          {
+            label: "↻ Retry",
+            tone: "primary",
+            onPick: () => void runDoctorMatch(patch)
+          }
+        ]
+      });
+    }
   }
 
   function parseApiError(err: unknown) {
@@ -885,20 +1507,34 @@ export default function ChatApp({ onBack }: ChatAppProps) {
     const did = doctorIdRef.current;
     if (!did) return false;
 
-    const sid = await ensureSession();
+    const sid = sessionIdRef.current ?? (await ensureSession());
     if (!sid) return false;
+
+    let doctor = picked;
+    try {
+      const liveFees = await getDoctorFees(did);
+      doctor = { ...picked, price: liveFees };
+      doctorsRef.current = doctorsRef.current.map((d) => (d.id === did ? doctor : d));
+    } catch {
+      /* use last known prices; server returns live feeInr on booking */
+    }
 
     const res = await createBooking({
       sessionId: sid,
       doctorId: did,
       slotAtIso,
       mode: visitMode,
-      patient: { name: "Ravi K." }
+      patient: buildPatientPayload()
     });
 
     const ref = `CC-${res.booking.id.toUpperCase()}`;
     bookingIdRef.current = res.booking.id;
     bookingRefLabelRef.current = ref;
+    bookingFeeRef.current = res.booking.feeInr ?? doctor.price[res.booking.mode];
+    approvalShownRef.current = false;
+    lastDoctorRescheduleAtRef.current = null;
+    lastSyncedSlotAtIsoRef.current = res.booking.slotAtIso;
+    supportWelcomedRef.current = false;
     selectedSlotRef.current = { atIso: res.booking.slotAtIso, mode: res.booking.mode };
     modeRef.current = res.booking.mode;
     setMode(res.booking.mode);
@@ -909,7 +1545,7 @@ export default function ChatApp({ onBack }: ChatAppProps) {
     push({
       from: "bot",
       kind: "text",
-      text: `✅ Rescheduled! ${picked.name} • ${modeLabel} • ${when} • Ref ${ref} • Fee ₹${picked.price[res.booking.mode]}`
+      text: `✅ Rescheduled! ${doctor.name} • ${modeLabel} • ${when} • Ref ${ref} • Fee ₹${res.booking.feeInr ?? doctor.price[res.booking.mode]}`
     });
     pushPostBookingChips();
     return true;
@@ -932,6 +1568,7 @@ export default function ChatApp({ onBack }: ChatAppProps) {
       try {
         const res = await rescheduleBooking(bid, { slotAtIso, mode: visitMode });
         selectedSlotRef.current = { atIso: res.booking.slotAtIso, mode: res.booking.mode };
+        lastSyncedSlotAtIsoRef.current = res.booking.slotAtIso;
         modeRef.current = res.booking.mode;
         setMode(res.booking.mode);
 
@@ -939,10 +1576,13 @@ export default function ChatApp({ onBack }: ChatAppProps) {
         const modeLabel = res.booking.mode === "home" ? "Home visit" : "Video consult";
         const when = formatAppointmentTime(res.booking.slotAtIso);
 
+        bookingFeeRef.current = res.booking.feeInr ?? picked.price[res.booking.mode];
+        supportWelcomedRef.current = false;
+
         push({
           from: "bot",
           kind: "text",
-          text: `✅ Rescheduled! ${picked.name} • ${modeLabel} • ${when} • Ref ${ref} • Fee ₹${picked.price[res.booking.mode]}`
+          text: `✅ Rescheduled! ${picked.name} • ${modeLabel} • ${when} • Ref ${ref} • Fee ₹${res.booking.feeInr ?? picked.price[res.booking.mode]}`
         });
         pushPostBookingChips();
         return;
@@ -987,7 +1627,8 @@ export default function ChatApp({ onBack }: ChatAppProps) {
     picked: Doctor,
     slot: SelectedSlot,
     ref: string,
-    checklist: Array<{ id: string; when: "now" | "before"; text: string }>
+    checklist: Array<{ id: string; when: "now" | "before"; text: string }>,
+    feeInr: number
   ) {
     const modeLabel = slot.mode === "home" ? "Home visit" : "Video consult";
     const when = formatAppointmentTime(slot.atIso);
@@ -998,7 +1639,7 @@ export default function ChatApp({ onBack }: ChatAppProps) {
     push({
       from: "bot",
       kind: "text",
-      text: `✅ Booking confirmed! ${picked.name} • ${modeLabel} • ${when} • Ref ${ref} • Fee ₹${picked.price[slot.mode]}`
+      text: `✅ Booking confirmed! ${picked.name} • ${modeLabel} • ${when} • Ref ${ref} • Fee ₹${feeInr}`
     });
     push({
       from: "bot",
@@ -1010,6 +1651,11 @@ export default function ChatApp({ onBack }: ChatAppProps) {
       kind: "checklist",
       title: "Care prep checklist",
       items: checklist
+    });
+    push({
+      from: "bot",
+      kind: "text",
+      text: "Have a question about your visit? Type a message below — e.g. Hi — and I'll help."
     });
     pushPostBookingChips();
   }
@@ -1080,19 +1726,40 @@ export default function ChatApp({ onBack }: ChatAppProps) {
       }
     }
 
+    let pickedLive = picked;
+    try {
+      const liveFees = await getDoctorFees(did);
+      pickedLive = { ...picked, price: liveFees };
+      doctorsRef.current = doctorsRef.current.map((d) => (d.id === did ? pickedLive : d));
+      setDoctors(doctorsRef.current);
+    } catch {
+      /* server returns live feeInr on booking */
+    }
+
     const res = await createBooking({
       sessionId: sid,
       doctorId: did,
       slotAtIso: slot.atIso,
       mode: slot.mode,
-      patient: { name: "Ravi K." }
+      patient: buildPatientPayload()
     });
 
     const ref = `CC-${res.booking.id.toUpperCase()}`;
     bookingIdRef.current = res.booking.id;
     bookingRefLabelRef.current = ref;
+    bookingFeeRef.current = res.booking.feeInr ?? pickedLive.price[res.booking.mode];
+    approvalShownRef.current = false;
+    lastDoctorRescheduleAtRef.current = null;
+    lastSyncedSlotAtIsoRef.current = res.booking.slotAtIso;
+    supportWelcomedRef.current = false;
     selectedSlotRef.current = { atIso: res.booking.slotAtIso, mode: res.booking.mode };
-    pushBookingSuccess(picked, { atIso: res.booking.slotAtIso, mode: res.booking.mode }, ref, res.checklist);
+    pushBookingSuccess(
+      pickedLive,
+      { atIso: res.booking.slotAtIso, mode: res.booking.mode },
+      ref,
+      res.checklist,
+      res.booking.feeInr ?? pickedLive.price[res.booking.mode]
+    );
     return true;
   }
 
@@ -1256,9 +1923,9 @@ export default function ChatApp({ onBack }: ChatAppProps) {
             <p className="brandTagline">Safe triage • Verified doctors • Home care</p>
           </div>
           <button className="chatRow active" type="button">
-            <div className="avatar cc">RK</div>
+            <div className="avatar cc">{nameInitials(patientName || "You")}</div>
             <div className="chatMeta">
-              <div className="chatName">Ravi K.</div>
+              <div className="chatName">{patientName || "You"}</div>
               <div className="chatPreview">Feeling a bit unwell…</div>
             </div>
           </button>
@@ -1475,17 +2142,32 @@ export default function ChatApp({ onBack }: ChatAppProps) {
                   value={inputText}
                   onChange={(e) => setInputText(e.target.value)}
                   placeholder={
-                    step === "greeting" || (step === "symptoms" && assessmentActive)
-                      ? "Tap an option above to continue…"
-                      : step === "assessment" && triageResult
-                        ? "Tap “Book a doctor” above, or type here…"
-                        : "Type a message…"
+                    step === "profile" && profilePhase === "gender"
+                      ? "Tap your gender above…"
+                      : step === "profile"
+                        ? profilePhase === "name"
+                          ? "Type your full name…"
+                          : profilePhase === "age"
+                            ? "Type your age…"
+                            : profilePhase === "phone"
+                              ? "Type your 10-digit mobile number…"
+                              : profilePhase === "city"
+                                ? "Type your city…"
+                                : profilePhase === "village"
+                                  ? "Type village or locality…"
+                                  : profilePhase === "pincode"
+                                    ? "Type 6-digit pincode…"
+                                    : "Type house / flat number…"
+                        : step === "greeting" || (step === "symptoms" && assessmentActive)
+                          ? "Tap an option above to continue…"
+                          : step === "assessment" && triageResult
+                            ? "Tap “Book a doctor” above, or type here…"
+                            : bookingComplete && step === "confirm"
+                              ? "Ask about your appointment — try Hi…"
+                              : "Type a message…"
                   }
                   onKeyDown={(e) => {
-                    if (e.key === "Enter" && inputText.trim()) {
-                      push({ from: "user", kind: "text", text: inputText.trim() });
-                      setInputText("");
-                    }
+                    if (e.key === "Enter") submitChatInput();
                   }}
                 />
                 {step === "assessment" && triageResult ? (
@@ -1499,11 +2181,7 @@ export default function ChatApp({ onBack }: ChatAppProps) {
                     className="sendBtn"
                     type="button"
                     aria-label="Send"
-                    onClick={() => {
-                      if (!inputText.trim()) return;
-                      push({ from: "user", kind: "text", text: inputText.trim() });
-                      setInputText("");
-                    }}
+                    onClick={() => submitChatInput()}
                   >
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
                       <path d="M2 21l21-9L2 3v7l15 2-15 2v7z"/>
